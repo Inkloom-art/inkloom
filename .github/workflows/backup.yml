@@ -1,5 +1,10 @@
 name: Backup
 
+env:
+  # Private by default, and it must stay that way: no public dev URL, no custom
+  # domain. See the storage step for why this is not a GitHub artifact.
+  BACKUP_BUCKET: inkloom-backups
+
 # Runs OUTSIDE Cloudflare on purpose.
 #
 # A Worker cannot run pg_dump, and more importantly a backup living in the same
@@ -122,26 +127,74 @@ jobs:
           fi
 
       # Retention lives here, declaratively. GitHub deletes the artifact when it
-      # expires, so nothing has to remember to prune and a pruning bug cannot
-      # quietly delete everything.
+      # ---------------------------------------------------------------------
+      # STORED IN R2, NOT IN A GITHUB ARTIFACT.
+      #
+      # This repository is PUBLIC, and GitHub's rule for artifacts is that
+      # anyone signed in with READ access to the repository can download them —
+      # which on a public repository is everybody. The artifact LISTING is worse
+      # still: it answers anonymously, so a stranger could see that production
+      # backups existed, how large they were and when they were taken, without
+      # logging in at all.
+      #
+      # The archives were encrypted, so this was never a disclosure of anybody's
+      # data. But it meant the only thing standing between 368 people's personal
+      # details and the public internet was one secret, with no access control
+      # behind it, on files that sat there for thirty days. Encryption is
+      # supposed to be the second lock, not the only one.
+      #
+      # An R2 bucket is private by default and has no anonymous listing. Do NOT
+      # attach a public dev URL or a custom domain to this bucket — that is the
+      # one setting that would undo all of the above.
       #
       # Only `.enc` is uploaded. The glob is the last line of defence: if
-      # encryption were ever skipped, this step finds no files and fails rather
-      # than publishing a readable copy of the database.
+      # encryption were ever skipped, this step finds no file and fails rather
+      # than storing a readable copy of the database.
       #
-      # `if` on the guard, not on `if-no-files-found`. Keeping the glob strict
-      # is the point — but an environment that legitimately produced nothing was
-      # still reaching it, so a backup job reported FAILED for a database that
-      # had simply never been migrated. A red backup that means "nothing to do"
-      # is worse than no alert, because the next real failure looks the same.
-      - name: Store it off-site
+      # `if` on the guard rather than on a missing-file option. Keeping the glob
+      # strict is the point — but an environment that legitimately produced
+      # nothing was still reaching it, so a backup job reported FAILED for a
+      # database that had simply never been migrated. A red backup that means
+      # "nothing to do" is worse than no alert, because the next real failure
+      # looks exactly the same.
+      #
+      # ONE-TIME SETUP, if this is a fresh deployment:
+      #   wrangler r2 bucket create inkloom-backups
+      #   wrangler r2 bucket lifecycle add inkloom-backups expire "" \
+      #     --expire-days 30
+      # and give CLOUDFLARE_API_TOKEN the "Workers R2 Storage: Edit" permission.
+      # ---------------------------------------------------------------------
+      - name: Store it off-site, privately
         if: steps.dump.outputs.archived == 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: backup-${{ matrix.environment }}-${{ github.run_id }}
-          path: backups/*.sql.gz.enc
-          retention-days: 30
-          if-no-files-found: error
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          BUCKET: ${{ env.BACKUP_BUCKET }}
+          ENVIRONMENT: ${{ matrix.environment }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${CLOUDFLARE_API_TOKEN:-}" ] || [ -z "${CLOUDFLARE_ACCOUNT_ID:-}" ]; then
+            echo "::error title=Cannot store the backup::CLOUDFLARE_API_TOKEN and \
+            CLOUDFLARE_ACCOUNT_ID must be set, and the token needs the \
+            'Workers R2 Storage: Edit' permission. A backup that was taken and not \
+            stored is not a backup, so this fails rather than passing quietly."
+            exit 1
+          fi
+
+          archive=$(ls backups/*.sql.gz.enc | head -1)
+          name=$(basename "$archive")
+
+          # The dated copy is the history; `latest` is a stable name the restore
+          # test can fetch without needing to list the bucket, which wrangler
+          # cannot do. Two writes of a file under a megabyte.
+          for key in "$ENVIRONMENT/$name" "$ENVIRONMENT/latest.sql.gz.enc"; do
+            echo "  -> r2://$BUCKET/$key"
+            pnpm exec wrangler r2 object put "$BUCKET/$key" \
+              --file "$archive" --remote --content-type application/octet-stream
+          done
+
+          echo "  stored $name ($(du -h "$archive" | cut -f1)) in r2://$BUCKET/$ENVIRONMENT/"
 
       - name: Report failure
         if: failure()
@@ -158,10 +211,10 @@ jobs:
     timeout-minutes: 30
     if: github.event.schedule == '0 4 * * 0' || github.event.inputs.restore_test == 'true'
     permissions:
+      # Read-only, and no `actions: read` any more. Archives no longer live in
+      # GitHub artifacts, so this job has nothing to read from the Actions API
+      # and should not be able to.
       contents: read
-      # To list and download artifacts from PREVIOUS runs, which is the whole
-      # point: testing an archive that has been sitting in storage.
-      actions: read
 
     services:
       postgres:
@@ -210,46 +263,39 @@ jobs:
       # would ever need, and reported that as backup health.
       - name: Fetch the newest stored archive
         env:
-          GH_TOKEN: ${{ github.token }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          BUCKET: ${{ env.BACKUP_BUCKET }}
         run: |
           set -euo pipefail
           mkdir -p backups
 
-          pick() {
-            gh api "repos/${{ github.repository }}/actions/artifacts?per_page=100" \
-              --jq "[.artifacts[] | select(.name | startswith(\"backup-$1-\"))
-                     | select(.expired == false)]
-                    | sort_by(.created_at) | reverse | .[0].id // empty"
+          # `latest` rather than a search through the bucket: wrangler has no
+          # `r2 object list`, and the nightly job writes this name every time.
+          # It is still an archive that has been SITTING IN STORAGE, written
+          # hours earlier by a different run — which is the property that
+          # matters. A restore test that takes a backup and immediately restores
+          # it proves the code works and nothing about the thing you would
+          # actually reach for.
+          fetch() {
+            pnpm exec wrangler r2 object get "$BUCKET/$1/latest.sql.gz.enc" \
+              --file "backups/$1-latest.sql.gz.enc" --remote 2>/dev/null
           }
 
-          id=$(pick production)
-          if [ -n "$id" ]; then
+          if fetch production; then
             echo "Restoring the PRODUCTION archive."
+          elif fetch staging; then
+            echo "::notice::No production archive stored; falling back to staging."
           else
-            id=$(pick staging)
-            [ -n "$id" ] && echo "::notice::No production archive stored; falling back to staging."
-          fi
-
-          if [ -z "$id" ]; then
-            runs=$(gh api "repos/${{ github.repository }}/actions/workflows/backup.yml/runs?status=success&per_page=1" \
-                     --jq '.total_count // 0')
-
-            if [ "$runs" = "0" ]; then
-              echo "::error title=No backup has run yet::There is nothing stored to restore, because \
-              the backup job has never completed successfully. This is the first-run case, not an \
-              outage: run this workflow once with 'Run the restore test' UNCHECKED to take and store \
-              a backup, then run it again with the box checked."
-            else
-              echo "::error title=No stored backup::Backups have succeeded before, but no unexpired \
-              backup-staging-* artifact exists now. Either every archive has expired (retention is 30 \
-              days) or they were deleted. Treat this as a backup outage."
-            fi
+            echo "::error title=No stored backup::Nothing could be fetched from \
+            r2://$BUCKET. Either the backup job has never completed successfully \
+            (run this workflow once with 'Run the restore test' UNCHECKED first), or \
+            CLOUDFLARE_API_TOKEN lacks the 'Workers R2 Storage: Edit' permission, or \
+            this is a genuine backup outage. All three are worth interrupting someone \
+            for, so none of them passes quietly."
             exit 1
           fi
 
-          echo "Restoring stored artifact $id"
-          gh api "repos/${{ github.repository }}/actions/artifacts/$id/zip" > artifact.zip
-          unzip -o -q artifact.zip -d backups
           ls -la backups
 
       - name: Decrypt, restore and interrogate
