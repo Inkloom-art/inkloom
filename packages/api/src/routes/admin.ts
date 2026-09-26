@@ -12,7 +12,7 @@
  * reached by an ordinary user — defence against the most likely future mistake.
  */
 import { Hono } from "hono";
-import { and, count, desc, eq, gte, ilike, isNull, lt, or, sql } from "drizzle-orm";
+import { and, count, desc, eq, gte, ilike, isNull, lt, ne, or, sql } from "drizzle-orm";
 import {
   abuseFlag,
   accessCodeCampaign,
@@ -47,12 +47,14 @@ import {
 import { templates } from "@inkloom/email";
 import type { Env } from "../context";
 import { apiError, ok, paged } from "../lib/response";
+import { attachmentFilename, toCsv } from "../lib/csv";
 import { periodStart } from "../lib/reporting-periods";
 import { body, query, validateBody, validateQuery } from "../middleware/validate";
 import { assertReason, requirePermission } from "../middleware/auth";
 import { bySubjectUser, rateLimit } from "../middleware/rate-limit";
 import {
   adjustCreditsSchema,
+  adminUserExportSchema,
   adminUserListSchema,
   auditQuerySchema,
   campaignActionSchema,
@@ -73,6 +75,15 @@ import {
 } from "../schemas/index";
 
 export const adminRoutes = new Hono<Env>();
+
+/**
+ * The most accounts one export will produce.
+ *
+ * Generous — the point is not to ration exports but to stop a single request
+ * building an unbounded string in a Worker's memory, which fails as an
+ * out-of-memory kill rather than as an error anybody can read.
+ */
+const EXPORT_ROW_LIMIT = 50_000;
 
 /**
  * Blanket gate. Every specific route adds its own, narrower permission.
@@ -410,6 +421,176 @@ adminRoutes.get(
     const page = hasMore ? rows.slice(0, q.limit) : rows;
 
     return ok(c, paged(page, hasMore ? (page.at(-1)?.createdAt.toISOString() ?? null) : null));
+  },
+);
+
+/**
+ * The account list as a CSV file.
+ *
+ * Mounted BEFORE `/users/:id`, because Hono matches in declaration order and a
+ * later static path loses to an earlier parameterised one — `/users/export`
+ * would arrive as a lookup for the account whose id is "export", and answer 404
+ * for a route that exists.
+ *
+ * `users.export` rather than `users.read`, and they are deliberately different
+ * permissions. Reading is looking one person up to answer their support ticket;
+ * this is every address the platform holds, in one file, on somebody's laptop,
+ * beyond any further control the platform has. Front-line support can do the
+ * first and not the second.
+ */
+adminRoutes.get(
+  "/users/export",
+  requirePermission("users.export"),
+  validateQuery(adminUserExportSchema),
+  async (c) => {
+    const { db, audit } = c.get("services");
+    const admin = c.get("principal")!;
+    const q = query<{
+      q?: string;
+      status?: string;
+      verified?: string;
+      role?: string;
+      signedUpAfter?: string;
+      signedUpBefore?: string;
+      label?: string;
+    }>(c);
+
+    const filters = [];
+    if (q.q) {
+      const term = `%${q.q.trim()}%`;
+      filters.push(
+        or(
+          ilike(userTable.normalizedEmail, term.toLowerCase()),
+          ilike(userTable.name, term),
+          eq(userTable.id, q.q.trim()),
+        ),
+      );
+    }
+    if (q.status) filters.push(eq(userTable.status, q.status as "active"));
+    if (q.verified) filters.push(eq(userTable.emailVerified, q.verified === "true"));
+    if (q.role) filters.push(eq(userTable.role, q.role));
+    if (q.signedUpAfter) filters.push(gte(userTable.createdAt, new Date(q.signedUpAfter)));
+    if (q.signedUpBefore) filters.push(lt(userTable.createdAt, new Date(q.signedUpBefore)));
+
+    /*
+     * Erased accounts are excluded unless they are asked for by name.
+     *
+     * A tombstone carries no usable address — anonymisation has already been
+     * over it — so exporting one produces a row of scrubbed placeholders that
+     * looks like a real participant until somebody tries to mail it.
+     */
+    if (!q.status) filters.push(ne(userTable.status, "deleted"));
+
+    const rows = await db
+      .select({
+        id: userTable.id,
+        email: userTable.email,
+        name: userTable.name,
+        emailVerified: userTable.emailVerified,
+        role: userTable.role,
+        status: userTable.status,
+        createdAt: userTable.createdAt,
+        lastLoginAt: userTable.lastLoginAt,
+        campaign: accessCodeCampaign.name,
+        creditsGranted: accessCodeRedemption.creditsGranted,
+        redeemedAt: accessCodeRedemption.redeemedAt,
+      })
+      .from(userTable)
+      /*
+       * Which campaign brought them in, which is the question this export
+       * mostly exists to answer: an event's participants are the people who
+       * redeemed that event's code, and nothing else distinguishes them.
+       */
+      .leftJoin(accessCodeRedemption, eq(accessCodeRedemption.userId, userTable.id))
+      .leftJoin(accessCodeCampaign, eq(accessCodeCampaign.id, accessCodeRedemption.campaignId))
+      .where(filters.length ? and(...filters) : undefined)
+      .orderBy(desc(userTable.createdAt))
+      .limit(EXPORT_ROW_LIMIT + 1);
+
+    /*
+     * Refuse rather than truncate.
+     *
+     * A file that is quietly missing its last thousand rows is worse than no
+     * file: it is acted on as though it were complete. The limit is generous
+     * and the message says how to narrow the range.
+     */
+    if (rows.length > EXPORT_ROW_LIMIT) {
+      throw apiError("VALIDATION_ERROR", {
+        details: {
+          range:
+            `That matches more than ${EXPORT_ROW_LIMIT} accounts, which is more than one ` +
+            `file should carry. Narrow it with a signed-up date range and export in parts.`,
+        },
+      });
+    }
+
+    const csv = toCsv(
+      [
+        { header: "email", value: (r: (typeof rows)[number]) => r.email },
+        { header: "name", value: (r: (typeof rows)[number]) => r.name },
+        { header: "email_verified", value: (r: (typeof rows)[number]) => r.emailVerified },
+        { header: "status", value: (r: (typeof rows)[number]) => r.status },
+        { header: "role", value: (r: (typeof rows)[number]) => r.role },
+        { header: "signed_up_at", value: (r: (typeof rows)[number]) => r.createdAt },
+        { header: "last_login_at", value: (r: (typeof rows)[number]) => r.lastLoginAt },
+        { header: "campaign", value: (r: (typeof rows)[number]) => r.campaign },
+        { header: "credits_granted", value: (r: (typeof rows)[number]) => r.creditsGranted },
+        /*
+         * `code_redeemed_at`, not `redeemed_at`.
+         *
+         * Clearer in a spreadsheet next to `campaign`, and it keeps the
+         * column-alias guard quiet: that test scans for raw SQL naming columns
+         * that do not exist, and `redeemedAt` is stored in `created_at`, so a
+         * bare "redeemed_at" string reads to it as a query that would fail at
+         * runtime with SQLSTATE 42703. The Drizzle select above is correct
+         * either way; this is the header label.
+         */
+        { header: "code_redeemed_at", value: (r: (typeof rows)[number]) => r.redeemedAt },
+        { header: "user_id", value: (r: (typeof rows)[number]) => r.id },
+      ],
+      rows,
+    );
+
+    /*
+     * Recorded before the file is handed over, and WITHOUT the addresses.
+     *
+     * Who exported the platform's entire mailing list, when, and how much of it
+     * is exactly the question asked after something leaks — so it is written
+     * down every time, like every other admin action. The filters go in because
+     * they describe the scope; the rows do not, because copying the personal
+     * data into the audit trail to record that personal data was copied is not
+     * a safeguard, it is a second copy.
+     */
+    await audit.recordStandalone({
+      action: "users.exported",
+      actorType: "admin",
+      actorId: admin.userId,
+      actorRole: admin.role,
+      targetType: "users",
+      metadata: {
+        rows: rows.length,
+        filters: {
+          q: q.q ?? null,
+          status: q.status ?? null,
+          verified: q.verified ?? null,
+          role: q.role ?? null,
+          signedUpAfter: q.signedUpAfter ?? null,
+          signedUpBefore: q.signedUpBefore ?? null,
+        },
+      },
+      requestId: c.get("requestId"),
+      ipHash: c.get("ipHash"),
+    });
+
+    const stem = attachmentFilename(
+      `inkloom-accounts-${q.label ?? "all"}-${new Date().toISOString().slice(0, 10)}`,
+    );
+    return c.body(csv, 200, {
+      "content-type": "text/csv; charset=utf-8",
+      "content-disposition": `attachment; filename="${stem}.csv"`,
+      // Personal data: never in a shared cache, never on disk at an edge.
+      "cache-control": "no-store, private",
+    });
   },
 );
 

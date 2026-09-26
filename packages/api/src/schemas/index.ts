@@ -299,6 +299,20 @@ export const adminUserListSchema = paginationSchema.extend({
   signedUpBefore: z.iso.datetime().optional(),
 });
 
+/**
+ * The export takes the SAME filters as the list and no pagination.
+ *
+ * Same filters so that what an operator exports is what they were just looking
+ * at — an export that silently covers a different population than the screen
+ * above it is a trap. No cursor because a paginated export is not an export.
+ */
+export const adminUserExportSchema = adminUserListSchema
+  .omit({ limit: true, cursor: true })
+  .extend({
+    /** Marks the file, so two exports in a folder can be told apart. */
+    label: z.string().trim().max(40).optional(),
+  });
+
 export const suspendUserSchema = z.object({
   reason: reasonSchema,
   /** Also kill their sessions. Default true — a suspension should take effect now. */

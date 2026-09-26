@@ -49,9 +49,44 @@ export default function AdminUsers({ loaderData }: Route.ComponentProps) {
   const adminPath = useAdminPath();
   const [params] = useSearchParams();
 
+  /*
+   * The filters on screen, minus the cursor.
+   *
+   * `cursor` is where THIS page of the table starts, and carrying it into an
+   * export would silently drop everyone before it — a file that looks complete
+   * and is missing the first few hundred people.
+   */
+  const exportQuery = new URLSearchParams();
+  for (const key of ["q", "status", "verified", "role"]) {
+    const value = params.get(key);
+    if (value) exportQuery.set(key, value);
+  }
+
   return (
     <>
-      <PageHeader title="Users" description="Search by email, name or user id." />
+      <PageHeader
+        title="Users"
+        description="Search by email, name or user id."
+        actions={
+          /*
+           * A plain link, not a fetch.
+           *
+           * The browser has to do this navigation itself for the download to
+           * reach the disk: `content-disposition: attachment` is an instruction
+           * to the BROWSER, and a fetch would hand the file to JavaScript
+           * instead, which would then have to rebuild it as a blob to save it.
+           * A GET carries the session cookie same-origin, and the API exempts
+           * safe methods from the origin guard, so this works as written.
+           *
+           * It carries whatever filters are on screen, so what downloads is
+           * what the operator is looking at rather than a different population
+           * with the same name.
+           */
+          <a className="btn btn-outline" href={`/api/v1/admin/users/export?${exportQuery}`}>
+            Download CSV
+          </a>
+        }
+      />
 
       <Form
         method="get"
