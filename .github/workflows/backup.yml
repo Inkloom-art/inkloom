@@ -190,8 +190,11 @@ jobs:
           # cannot do. Two writes of a file under a megabyte.
           for key in "$ENVIRONMENT/$name" "$ENVIRONMENT/latest.sql.gz.enc"; do
             echo "  -> r2://$BUCKET/$key"
-            pnpm exec wrangler r2 object put "$BUCKET/$key" \
-              --file "$archive" --remote --content-type application/octet-stream
+            # `--filter`, because wrangler is a dependency of apps/web rather
+            # than of the workspace root, and `pnpm exec` from the root does not
+            # look into a workspace package's bin directory.
+            pnpm --filter @inkloom/web exec wrangler r2 object put "$BUCKET/$key" \
+              --file "../../$archive" --remote --content-type application/octet-stream
           done
 
           echo "  stored $name ($(du -h "$archive" | cut -f1)) in r2://$BUCKET/$ENVIRONMENT/"
@@ -278,8 +281,11 @@ jobs:
           # it proves the code works and nothing about the thing you would
           # actually reach for.
           fetch() {
-            pnpm exec wrangler r2 object get "$BUCKET/$1/latest.sql.gz.enc" \
-              --file "backups/$1-latest.sql.gz.enc" --remote 2>/dev/null
+            # See the note in the backup job about `--filter`. Paths are
+            # relative to apps/web once pnpm has changed directory into it.
+            pnpm --filter @inkloom/web exec wrangler r2 object get \
+              "$BUCKET/$1/latest.sql.gz.enc" \
+              --file "../../backups/$1-latest.sql.gz.enc" --remote 2>/dev/null
           }
 
           if fetch production; then
