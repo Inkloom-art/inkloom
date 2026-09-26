@@ -26,6 +26,23 @@ export interface SendResult {
   ok: boolean;
   providerMessageId?: string;
   error?: string;
+  /**
+   * What the PROVIDER says about our usage, when it says anything.
+   *
+   * Worth capturing because our own count of `email_events` only knows about
+   * mail this application sent. The provider account can be shared — another
+   * service sending from the same Resend team draws down the same monthly
+   * allowance — and from inside here that spending is invisible. These numbers
+   * are the account's own, so they are the only ones that can reveal it.
+   */
+  quota?: ProviderQuota;
+}
+
+/** Usage as the mail provider reports it, in whatever units it chooses to. */
+export interface ProviderQuota {
+  /** Resend sends this to FREE-plan accounts only; its absence implies a paid plan. */
+  dailyUsed?: number;
+  monthlyUsed?: number;
 }
 
 export interface EmailTransport {

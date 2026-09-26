@@ -78,7 +78,9 @@ jobs:
           HEALTH_SOURCE: the scheduled watchdog in CI
           # Resend's free plan. Raise this when the plan is upgraded, or the
           # warning arrives at a ceiling that no longer exists.
-          EMAIL_DAILY_QUOTA: "100"
+          # The paid plan has no daily ceiling; the month is what binds.
+          EMAIL_DAILY_QUOTA: "0"
+          EMAIL_MONTHLY_QUOTA: "50000"
         run: |
           set -o pipefail
           flags=""

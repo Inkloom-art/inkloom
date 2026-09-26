@@ -7,7 +7,7 @@
  * spending the daily quota — and, worse, a typo in a fixture could put a real
  * stranger's address on a development send.
  */
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { DevelopmentMailRouter, ResendTransport, isUndeliverableTestAddress } from "../transport";
 import type { EmailTransport, SendEmailInput, SendResult } from "../types";
 
@@ -190,5 +190,86 @@ describe("the real provider never sees an address that cannot exist", () => {
 
     expect(fetchSpy).toHaveBeenCalledTimes(1);
     vi.unstubAllGlobals();
+  });
+});
+
+describe("what the provider says about the account", () => {
+  /*
+   * Our own count of `email_events` only knows about mail THIS application
+   * sent. The provider account can be shared, and a second service spending the
+   * same monthly allowance is invisible from in here — which is exactly the
+   * blind spot that let a stale, hardcoded ceiling go unnoticed until it fired
+   * a false critical. These headers are the account's own numbers.
+   */
+  const original = globalThis.fetch;
+  afterEach(() => {
+    globalThis.fetch = original;
+  });
+
+  /** Answer the send call with a given set of headers. */
+  function respondWith(headers: Record<string, string>, status = 200) {
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify({ id: "msg_1" }), {
+        status,
+        headers: { "content-type": "application/json", ...headers },
+      })) as typeof fetch;
+  }
+
+  const message = {
+    /*
+     * NOT an example.* or .test address. Those are RFC 2606 reserved, and the
+     * transport suppresses them before it ever reaches the provider — so a
+     * fixture using one silently tests the suppression path instead of the
+     * send path, and every assertion about response headers reads undefined.
+     */
+    to: "someone@inkloom.art",
+    template: "verify_email" as const,
+    subject: "Confirm",
+    html: "<p>hi</p>",
+    text: "hi",
+  };
+
+  it("reports the monthly figure the provider returns", async () => {
+    respondWith({ "x-resend-monthly-quota": "1234" });
+    const result = await new ResendTransport("re_test").send(message, "Inkloom <no-reply@x.test>");
+    expect(result.ok).toBe(true);
+    expect(result.quota?.monthlyUsed).toBe(1234);
+  });
+
+  it("treats a daily figure as the tell that this is a free plan", async () => {
+    /*
+     * The provider sends the daily header to free accounts ONLY, so its
+     * presence answers "which plan is this?" without anyone having to remember
+     * to write the answer down in configuration — which is how the wrong answer
+     * survived an upgrade and raised a critical over nothing.
+     */
+    respondWith({ "x-resend-daily-quota": "87", "x-resend-monthly-quota": "900" });
+    const result = await new ResendTransport("re_test").send(message, "Inkloom <no-reply@x.test>");
+    expect(result.quota?.dailyUsed).toBe(87);
+  });
+
+  it("says nothing about a plan when the provider does not", async () => {
+    respondWith({});
+    const result = await new ResendTransport("re_test").send(message, "Inkloom <no-reply@x.test>");
+    expect(result.quota?.dailyUsed).toBeUndefined();
+    expect(result.quota?.monthlyUsed).toBeUndefined();
+  });
+
+  it("still carries the figures when the send was refused", async () => {
+    /*
+     * A refusal is when the numbers matter MOST — a 429 for an exhausted quota
+     * is the one moment someone needs to know how much of the allowance is
+     * gone, and dropping the headers on the error path would lose it.
+     */
+    respondWith({ "x-resend-monthly-quota": "50000" }, 429);
+    const result = await new ResendTransport("re_test").send(message, "Inkloom <no-reply@x.test>");
+    expect(result.ok).toBe(false);
+    expect(result.quota?.monthlyUsed).toBe(50000);
+  });
+
+  it("ignores a header that is not a number", async () => {
+    respondWith({ "x-resend-monthly-quota": "unlimited" });
+    const result = await new ResendTransport("re_test").send(message, "Inkloom <no-reply@x.test>");
+    expect(result.quota?.monthlyUsed).toBeUndefined();
   });
 });

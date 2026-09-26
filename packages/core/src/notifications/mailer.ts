@@ -113,6 +113,26 @@ export class Mailer {
       })
       .where(eq(emailEvent.id, eventId));
 
+    /*
+     * The provider's own view of the account, recorded where it can be searched.
+     *
+     * Logged rather than stored: it would otherwise cost a second write on
+     * every single message to keep a number that only matters when somebody is
+     * asking. It is here because our `email_events` count cannot see a shared
+     * provider account — another service sending from the same Resend team
+     * spends the same monthly allowance, invisibly from in here.
+     */
+    if (result.quota?.monthlyUsed !== undefined || result.quota?.dailyUsed !== undefined) {
+      this.logger.info("email_provider_quota", {
+        transport: this.transport.name,
+        monthlyUsed: result.quota.monthlyUsed,
+        // Resend sends this to free-plan accounts only, so seeing it at all
+        // means the deployment is sending on a plan with a 100/day ceiling.
+        dailyUsed: result.quota.dailyUsed,
+        freePlan: result.quota.dailyUsed !== undefined,
+      });
+    }
+
     if (!result.ok) {
       // Loud, because undelivered verification mail silently blocks signup.
       this.logger.error("email_send_failed", {

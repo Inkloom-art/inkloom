@@ -108,7 +108,14 @@ export const envSchema = z.object({
    * and exhausting it fails silently, with the account created and no message
    * sent. 0 turns the check off.
    */
+  /*
+   * 0 means "this plan has no daily limit", which is the case on every paid
+   * mail plan. The default is 100 because that is the free plan's ceiling, and
+   * an unconfigured deployment is likeliest to be on it.
+   */
   EMAIL_DAILY_QUOTA: z.coerce.number().int().min(0).default(100),
+  /* The monthly allowance; 0 to not watch it. 3,000 is the free plan's. */
+  EMAIL_MONTHLY_QUOTA: z.coerce.number().int().min(0).default(3_000),
   /**
    * Whether the nightly backup and the weekly restore drill are expected to be
    * running. False while their schedules are deliberately paused, so a pause is

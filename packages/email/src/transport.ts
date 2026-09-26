@@ -97,6 +97,13 @@ export class MailpitTransport implements EmailTransport {
   }
 }
 
+/** A header that should be a number, or nothing if it is absent or isn't one. */
+function readCount(value: string | null): number | undefined {
+  if (value === null) return undefined;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : undefined;
+}
+
 /** Staging and production. */
 export class ResendTransport implements EmailTransport {
   readonly name = "resend";
@@ -110,9 +117,9 @@ export class ResendTransport implements EmailTransport {
      * RFC 2606 and RFC 6761 reserve these domains permanently, so no mailbox
      * behind one can ever be registered and every message to one is
      * undeliverable by definition. Sending anyway costs three things that all
-     * matter: a slot from a daily quota of 100, a hard bounce recorded against a
-     * domain whose sending reputation is brand new, and — at load-test volume —
-     * thousands of both.
+     * matter: a slot from the account's monthly allowance, a hard bounce
+     * recorded against a domain whose sending reputation is brand new, and — at
+     * load-test volume — thousands of both.
      *
      * The router above already did this in DEVELOPMENT. Doing it here means it
      * holds in staging and production too, which is where the quota and the
@@ -152,10 +159,22 @@ export class ResendTransport implements EmailTransport {
         name?: string;
       };
 
+      /*
+       * Resend reports usage on every response, and it is the only account-wide
+       * view we can get. `x-resend-daily-quota` is sent to FREE accounts only,
+       * so its presence is itself the answer to "which plan is this?" — which
+       * matters, because the daily limit exists only on the free plan and the
+       * paid plans are bounded by the month alone.
+       */
+      const quota = {
+        dailyUsed: readCount(response.headers.get("x-resend-daily-quota")),
+        monthlyUsed: readCount(response.headers.get("x-resend-monthly-quota")),
+      };
+
       if (!response.ok) {
-        return { ok: false, error: data.message ?? `Resend returned ${response.status}` };
+        return { ok: false, error: data.message ?? `Resend returned ${response.status}`, quota };
       }
-      return { ok: true, providerMessageId: data.id };
+      return { ok: true, providerMessageId: data.id, quota };
     } catch (error) {
       return describeSendError(error, "Resend");
     }

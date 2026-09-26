@@ -563,6 +563,7 @@ async function notifyOwnerOfProblems(
 
   const report = await checkHealth(db, {
     emailDailyQuota: services.config.EMAIL_DAILY_QUOTA,
+    emailMonthlyQuota: services.config.EMAIL_MONTHLY_QUOTA,
     backupsExpected: services.config.BACKUPS_EXPECTED,
   });
   if (report.problems.length === 0) {

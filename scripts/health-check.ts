@@ -33,7 +33,8 @@ async function main() {
     console.log(`\n  Health of ${environment} — ${describeTarget(url)}\n`);
 
     const report = await checkHealth(db, {
-      emailDailyQuota: Number(optional("EMAIL_DAILY_QUOTA", "100")),
+      emailDailyQuota: Number(optional("EMAIL_DAILY_QUOTA", "0")),
+      emailMonthlyQuota: Number(optional("EMAIL_MONTHLY_QUOTA", "50000")),
       backupsExpected: optional("BACKUPS_EXPECTED", "true") === "true",
     });
 

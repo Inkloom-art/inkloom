@@ -135,7 +135,8 @@
         "ANALYTICS_ENABLED": "true",
         "LOG_LEVEL": "info",
         "SENTRY_ENVIRONMENT": "staging",
-        "EMAIL_DAILY_QUOTA": "100",
+        "EMAIL_DAILY_QUOTA": "0",
+        "EMAIL_MONTHLY_QUOTA": "50000",
         "INKLOOM_RELEASE": "v1.0.0-staging",
       },
       // A SEPARATE Neon branch from production. Sharing one would put real
@@ -176,11 +177,24 @@
         "ANALYTICS_ENABLED": "true",
         "LOG_LEVEL": "info",
         "SENTRY_ENVIRONMENT": "production",
-        // Resend's free plan. The nightly health check warns at 80% of this and
-        // raises a critical at 100%, because every signup needs a verification
-        // email — so the mail quota IS the signup capacity, and running out is
-        // silent: the account is created and the message never leaves.
-        "EMAIL_DAILY_QUOTA": "100",
+        /*
+         * Resend Pro: 50,000 a month, and NO daily ceiling.
+         *
+         * The nightly health check warns at 80% of the monthly figure and
+         * raises a critical at 100%, because every signup needs a verification
+         * email — so the mail quota IS the signup capacity, and running out is
+         * silent: the account is created and the message never leaves.
+         *
+         * The daily value is 0 because a paid plan has no daily limit. It was
+         * 100 — the FREE plan's ceiling — which survived the upgrade and then
+         * declared a critical incident at 131 messages on an account with
+         * 49,000 left in the month. A quota written down here is a claim about
+         * somebody else's system, so it has to be corrected here when their
+         * side changes; `email_provider_quota` in the logs carries the
+         * provider's own figure for when this drifts again.
+         */
+        "EMAIL_DAILY_QUOTA": "0",
+        "EMAIL_MONTHLY_QUOTA": "50000",
         "BACKUPS_EXPECTED": "true",
         "INKLOOM_RELEASE": "v1.0.0",
       },

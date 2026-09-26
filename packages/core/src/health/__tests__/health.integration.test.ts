@@ -130,22 +130,35 @@ describe("each fault is caught on its own", () => {
 
 describe("the two ceilings that stop signup without an error", () => {
   /*
-   * Every signup sends a verification email. When the provider's daily quota
-   * runs out the account is still created, the mail never leaves, and the
-   * person waits on the "check your email" page indefinitely — a failure with
-   * no error attached to it anywhere.
+   * Every signup sends a verification email. When the provider's quota runs out
+   * the account is still created, the mail never leaves, and the person waits
+   * on the "check your email" page indefinitely — a failure with no error
+   * attached to it anywhere.
+   *
+   * WHICH quota is the part this got wrong in production, so it is pinned here.
+   * The alert watched a rolling 24 hours against a hardcoded 100 and called it
+   * "daily". 100 is the provider's FREE-plan ceiling; it survived the upgrade
+   * to a paid plan, where there is no daily limit at all and only the month
+   * binds. So a perfectly healthy account with 49,000 messages left in its
+   * allowance was told, at 131 sent, that new accounts would never hear from
+   * us. An alert that is wrong in that direction is worse than none: the next
+   * one gets ignored, and mail failing during a launch is precisely when it
+   * must not be.
    */
-  it("warns before the daily email quota runs out", async () => {
+  const PAID = { emailDailyQuota: 0, emailMonthlyQuota: 50_000 };
+  const FREE = { emailDailyQuota: 100, emailMonthlyQuota: 3_000 };
+
+  it("warns before the monthly email quota runs out", async () => {
     await sendMail(85);
-    const report = await checkHealth(test.db);
+    const report = await checkHealth(test.db, { emailDailyQuota: 0, emailMonthlyQuota: 100 });
     expect(report.problems).toContainEqual(
       expect.objectContaining({ code: "email.quota", severity: "warning" }),
     );
   });
 
-  it("calls an exhausted quota critical", async () => {
+  it("calls an exhausted monthly quota critical", async () => {
     await sendMail(100);
-    const report = await checkHealth(test.db);
+    const report = await checkHealth(test.db, { emailDailyQuota: 0, emailMonthlyQuota: 100 });
     expect(report.problems).toContainEqual(
       expect.objectContaining({ code: "email.quota", severity: "critical" }),
     );
@@ -153,7 +166,51 @@ describe("the two ceilings that stop signup without an error", () => {
 
   it("says nothing at ordinary volume", async () => {
     await sendMail(10);
-    expect(await codes()).not.toContain("email.quota");
+    const report = await checkHealth(test.db, PAID);
+    expect(report.problems.map((p) => p.code)).not.toContain("email.quota");
+  });
+
+  it("does not invent a daily crisis on a plan with no daily limit", async () => {
+    /*
+     * The exact production incident, reproduced: 131 messages in a day on the
+     * paid plan. Nothing is wrong, and nothing may be reported.
+     */
+    await sendMail(131);
+    const report = await checkHealth(test.db, PAID);
+    const reported = report.problems.map((p) => p.code);
+    expect(reported).not.toContain("email.quota");
+    expect(reported).not.toContain("email.quota.daily");
+    expect(report.context.email_quota).toContain("of 50000");
+  });
+
+  it("still watches the daily ceiling on a plan that has one", async () => {
+    /*
+     * The free plan's limit is real, so removing the daily check outright would
+     * trade one blind spot for another. It is watched when it exists.
+     */
+    await sendMail(131);
+    const report = await checkHealth(test.db, FREE);
+    expect(report.problems).toContainEqual(
+      expect.objectContaining({ code: "email.quota.daily", severity: "critical" }),
+    );
+  });
+
+  it("counts the month as the provider bills it, not as a rolling window", async () => {
+    /*
+     * The provider resets on a UTC calendar boundary. A rolling window drags
+     * the previous period's sends into this one and reports a ceiling that is
+     * never the ceiling the provider is applying.
+     */
+    await sendMail(40);
+    await test.db.execute(sql`
+      UPDATE email_events SET created_at = date_trunc('month', now() AT TIME ZONE 'UTC')
+                                           - interval '2 days'
+    `);
+    const report = await checkHealth(test.db, { emailDailyQuota: 0, emailMonthlyQuota: 50 });
+    expect(
+      report.problems.map((p) => p.code),
+      "last month's mail is not this month's spend",
+    ).not.toContain("email.quota");
   });
 
   // A full campaign tells every new arrival their code is "invalid or

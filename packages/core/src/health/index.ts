@@ -63,13 +63,15 @@ export interface HealthOptions {
    */
   backupsExpected?: boolean;
   /**
-   * The mail provider's daily send limit, or 0 to not watch it.
+   * The mail provider's daily send limit, or 0 when the plan has none.
    *
    * Passed in rather than read from the environment: inside a Worker,
    * `process.env` does not carry the deployment's `vars`, so a value configured
    * there would have been ignored while appearing to be set.
    */
   emailDailyQuota?: number;
+  /** The mail provider's monthly send limit, or 0 to not watch it. */
+  emailMonthlyQuota?: number;
 }
 
 export async function checkHealth(
@@ -177,36 +179,84 @@ export async function checkHealth(
   }
 
   /*
-   * The provider's daily quota, which nothing else in the system can see.
+   * The provider's send quota, which nothing else in the system can see.
    *
    * Every signup sends a verification email, so the mail quota IS the signup
    * capacity. Exhaust it and signup does not fail loudly — the account is
-   * created, the email never arrives, and the person sits on the
-   * "check your email" page forever. There is no error anywhere that says so.
+   * created, the email never arrives, and the person sits on the "check your
+   * email" page forever. There is no error anywhere that says so.
    *
-   * The threshold is a warning well before the ceiling, because the useful
-   * moment to know is while there is still time to upgrade the plan.
+   * WHICH quota, though, is the part this got wrong, and it cried wolf for it.
+   *
+   * It watched a rolling 24-hour window against a hardcoded ceiling of 100 and
+   * called that "the daily quota". Three things were wrong with that. The 100
+   * belongs to the provider's FREE plan, and survived the upgrade to a paid one
+   * because it lived in configuration rather than anywhere near the truth. A
+   * paid plan has NO daily limit at all — only a monthly one, which nothing
+   * here measured. And even on the free plan the number never matched: the
+   * provider counts a UTC calendar day that resets at midnight, not a window
+   * sliding backwards from now.
+   *
+   * So it reported "131 of 100 — critical, new accounts never hear from us" on
+   * an account with forty-nine thousand messages left in the month and nothing
+   * whatsoever wrong. That is worse than no alert: the next one gets ignored,
+   * and mail failing during a launch is exactly when it must not be.
+   *
+   * Now: the monthly allowance is watched as a UTC calendar month, matching how
+   * the provider bills it, and the daily ceiling is watched only when the plan
+   * actually has one (0 means it does not).
    */
-  const dailyQuota = options.emailDailyQuota ?? 100;
-  const sent = await db.execute<{ n: string }>(sql`
-    SELECT COUNT(*)::text AS n FROM email_events
-     WHERE created_at > now() - interval '24 hours'
+  const dailyQuota = options.emailDailyQuota ?? 0;
+  const monthlyQuota = options.emailMonthlyQuota ?? 0;
+
+  const sent = await db.execute<{ day: string; month: string }>(sql`
+    SELECT
+      COUNT(*) FILTER (WHERE created_at >= date_trunc('day', now() AT TIME ZONE 'UTC'))::text
+        AS day,
+      COUNT(*) FILTER (WHERE created_at >= date_trunc('month', now() AT TIME ZONE 'UTC'))::text
+        AS month
+    FROM email_events
   `);
-  const sentCount = Number(sent.rows[0]?.n ?? 0);
-  context.email_quota = `${sentCount} of ${dailyQuota} in 24h`;
-  if (dailyQuota > 0 && sentCount >= dailyQuota * 0.8) {
-    problems.push({
-      severity: sentCount >= dailyQuota ? "critical" : "warning",
-      code: "email.quota",
-      summary:
-        sentCount >= dailyQuota
-          ? "The daily email quota is exhausted"
-          : "The daily email quota is nearly used up",
-      detail:
-        `${sentCount} of ${dailyQuota} sent in the last 24 hours. Every signup needs a ` +
-        `verification email, so when this runs out new accounts are created and never hear ` +
-        `from us — with no error shown to them and none recorded here.`,
-    });
+  const sentToday = Number(sent.rows[0]?.day ?? 0);
+  const sentThisMonth = Number(sent.rows[0]?.month ?? 0);
+
+  if (monthlyQuota > 0) {
+    context.email_quota = `${sentThisMonth} of ${monthlyQuota} this month (UTC)`;
+    if (sentThisMonth >= monthlyQuota * 0.8) {
+      problems.push({
+        severity: sentThisMonth >= monthlyQuota ? "critical" : "warning",
+        code: "email.quota",
+        summary:
+          sentThisMonth >= monthlyQuota
+            ? "The monthly email quota is exhausted"
+            : "The monthly email quota is nearly used up",
+        detail:
+          `${sentThisMonth} of ${monthlyQuota} sent this calendar month. Every signup needs a ` +
+          `verification email, so when this runs out new accounts are created and never hear ` +
+          `from us — with no error shown to them and none recorded here. This counts only ` +
+          `mail THIS application sent; if the provider account is shared, the real figure is ` +
+          `higher, and the provider's own dashboard is the authority.`,
+      });
+    }
+  } else {
+    context.email_quota = `${sentThisMonth} this month (UTC), no monthly limit configured`;
+  }
+
+  if (dailyQuota > 0) {
+    context.email_quota_day = `${sentToday} of ${dailyQuota} today (UTC)`;
+    if (sentToday >= dailyQuota * 0.8) {
+      problems.push({
+        severity: sentToday >= dailyQuota ? "critical" : "warning",
+        code: "email.quota.daily",
+        summary:
+          sentToday >= dailyQuota
+            ? "The daily email quota is exhausted"
+            : "The daily email quota is nearly used up",
+        detail:
+          `${sentToday} of ${dailyQuota} sent today (UTC, resets at midnight). A daily ceiling ` +
+          `means this deployment is on the provider's free plan; upgrading removes it.`,
+      });
+    }
   }
 
   /*
