@@ -35,7 +35,29 @@ minimumReleaseAgeExclude:
 #
 # `pg` is pinned for the same reason: 8.23.1 requires `pg-protocol@^1.16.1`,
 # and only 1.16.0 is published. 8.23.0 is the version already in the lockfile.
+#
+# The block below is the same story as `sharp`: advisories in transitive build
+# and dev tooling that never reaches the deployed Worker, where the upstream
+# package has not yet bumped its own dependency. Each is the minimum patched
+# version named by the advisory, so they lift as soon as upstream catches up.
 overrides:
-  sharp: ">=0.35.4"
+  sharp: ">=0.35.5"
   rolldown: "1.2.7"
   pg: "8.23.0"
+  undici: ">=7.29.1"
+  source-map-js: ">=1.2.2"
+  proxy-addr: ">=2.0.8"
+  body-parser: ">=2.4.0"
+  compression: ">=1.8.2"
+  morgan: ">=1.12.1"
+  qs: ">=6.16.1"
+  esbuild: ">=0.24.3"
+  # NO brace-expansion override. Its three DoS advisories cover >=4.0.0, fixed
+  # in 5.0.12, and forcing that version globally breaks the build: v1 exported
+  # the expander directly and v5 moved it to a named export, so minimatch@3
+  # (reached through eslint 9) dies with "expand is not a function". The fix is
+  # eslint 10, whose minimatch@10 depends on brace-expansion ^5.0.12 already.
+  # Six advisories, all dev-server only (launch-editor argument handling and
+  # server.fs escapes) and all fixed in 8.2.4. Held below 8.3 because vite 8.2.4
+  # wants rolldown ~1.2.4, which the pin above satisfies; 8.3 moves that target.
+  vite: ">=8.2.4 <8.3.0"
