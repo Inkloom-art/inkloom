@@ -25,5 +25,17 @@ minimumReleaseAgeExclude:
 # In pnpm 11 overrides live HERE, not in package.json: the old `pnpm.overrides`
 # field is silently ignored, which looks exactly like an override that did not
 # work.
+#
+# `rolldown` is pinned because the registry is serving a broken dependency for
+# 1.2.9: it requires `@oxc-project/types@=0.150.0`, which is not published (the
+# latest is 0.149.0), so ANY re-resolution of vite's subtree fails the install
+# outright. 1.2.7 is what the lockfile already resolved and builds fine. This
+# pin is temporary — drop it once 1.2.9+ resolves, and note that the exact
+# version matters here, since a range would drift straight back into 1.2.9.
+#
+# `pg` is pinned for the same reason: 8.23.1 requires `pg-protocol@^1.16.1`,
+# and only 1.16.0 is published. 8.23.0 is the version already in the lockfile.
 overrides:
   sharp: ">=0.35.4"
+  rolldown: "1.2.7"
+  pg: "8.23.0"

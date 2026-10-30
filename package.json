@@ -59,7 +59,7 @@
     "@playwright/test": "^1.63.0",
     "@types/node": "^22.19.0",
     "@types/pg": "^8.15.6",
-    "better-auth": "1.7.3",
+    "better-auth": "1.7.12",
     "dotenv": "^17.2.4",
     "drizzle-orm": "^0.45.2",
     "eslint": "^9.39.0",
@@ -71,7 +71,7 @@
     "typescript": "^5.9.3",
     "typescript-eslint": "^8.48.0",
     "vitest": "^5.0.0",
-    "zod": "^4.5.4"
+    "zod": "^4.6.7"
   },
   "dependencies": {
     "@inkloom/api": "workspace:*",
