@@ -43,7 +43,9 @@ describe("error serialisation", () => {
   });
 
   it("walks a nested cause chain", () => {
-    const out = redact({ error: drizzleError(new Error("outer", { cause: new Error("root") })) }) as {
+    const out = redact({
+      error: drizzleError(new Error("outer", { cause: new Error("root") })),
+    }) as {
       error: { cause?: { cause?: { message?: string } } };
     };
 
@@ -58,12 +60,20 @@ describe("error serialisation", () => {
     expect(() => redact({ error: a })).not.toThrow();
   });
 
+  // The password here is the repo's own `inkloom_local_dev` placeholder rather
+  // than an invented one. check-secrets.ts applies its live-connection-string
+  // rule to test files on purpose — a real credential in a fixture is exactly
+  // as leaked as one anywhere else — so a realistic-looking DSN written here
+  // fails the scan, and rightly. The host stays remote because the assertion
+  // that matters is that the user and host SURVIVE while the password does not.
   it("strips the password from a connection string inside a message", () => {
     const out = redact({
-      error: new Error("connect failed: postgresql://neondb_owner:hunter2@ep-x.neon.tech/neondb"),
+      error: new Error(
+        "connect failed: postgresql://neondb_owner:inkloom_local_dev@ep-x.neon.tech/neondb",
+      ),
     }) as { error: { message: string } };
 
-    expect(out.error.message).not.toContain("hunter2");
+    expect(out.error.message).not.toContain("inkloom_local_dev");
     expect(out.error.message).toContain("neondb_owner");
     expect(out.error.message).toContain("ep-x.neon.tech");
   });
