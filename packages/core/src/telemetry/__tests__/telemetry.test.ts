@@ -9,7 +9,16 @@
  * tables out from under whatever else is running at the same time.
  */
 import { beforeEach, describe, expect, it } from "vitest";
-import { bucketFor, drain, record, reset, routeGroupFor, shouldFlush } from "../collector";
+import {
+  FLUSH_INTERVAL,
+  SCALE_TO_ZERO_IDLE_MS,
+  bucketFor,
+  drain,
+  record,
+  reset,
+  routeGroupFor,
+  shouldFlush,
+} from "../collector";
 import { percentileFrom } from "../flush";
 
 beforeEach(() => {
@@ -65,6 +74,50 @@ describe("collecting", () => {
     // Freshly reset, so the interval has not elapsed and one slot is far below
     // the volume ceiling: a single request must not trigger a database write.
     expect(shouldFlush()).toBe(false);
+  });
+});
+
+describe("the flush interval as a billing control", () => {
+  /*
+   * This is the regression guard for the outage of 29-30 October 2026.
+   *
+   * The flush is the only Postgres write that fires on traffic alone: no user,
+   * no session, no JavaScript, so an unauthenticated scanner is enough to
+   * trigger it. At 60 seconds it reset Neon's five-minute scale-to-zero timer
+   * before that timer could ever elapse, so the compute never suspended --
+   * ~16 hours a day awake, 110 CU-hours in a month against a 100 CU-hour
+   * allowance, and signups down for about 45 hours once it ran out.
+   *
+   * Any future tuning of the interval has to clear that window, so the
+   * invariant is asserted against the window rather than against a number
+   * somebody would have to remember the meaning of.
+   */
+  it("leaves room for the database to actually fall asleep", () => {
+    expect(FLUSH_INTERVAL).toBeGreaterThan(SCALE_TO_ZERO_IDLE_MS);
+  });
+
+  it("no longer writes at the old sixty-second cadence", () => {
+    record({ routeGroup: "marketing", status: 200, durationMs: 12 });
+    // A minute in: under the previous interval this was a database write, and
+    // the idle timer went back to zero.
+    expect(shouldFlush(Date.now() + 60_000 + 1)).toBe(false);
+  });
+
+  it("still writes once the interval has elapsed", () => {
+    record({ routeGroup: "marketing", status: 200, durationMs: 12 });
+    expect(shouldFlush(Date.now() + FLUSH_INTERVAL + 1)).toBe(true);
+  });
+
+  it("still flushes early on volume, so a burst is not held for half an hour", () => {
+    /*
+     * The volume ceiling is the safety valve the longer clock makes more
+     * important: counters now live far longer, so an isolate under real load
+     * must not accumulate without bound while waiting for the interval.
+     */
+    for (let i = 0; i < 64; i += 1) {
+      record({ routeGroup: `group-${i}`, status: 200, durationMs: 1 });
+    }
+    expect(shouldFlush()).toBe(true);
   });
 });
 

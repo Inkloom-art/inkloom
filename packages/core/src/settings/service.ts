@@ -1,10 +1,11 @@
 /**
  * Reads and writes feature flags and system settings.
  *
- * Values are cached for a few seconds. That bound matters: an emergency control
- * (pause signups, mass logout) must take effect quickly, so the TTL is short
- * enough to be operationally useful while still absorbing the per-request read
- * volume.
+ * Values are cached per key, for either a few seconds or a few minutes. Which
+ * one a key gets is decided by whether reading it wakes a sleeping database,
+ * not by how risky the key is -- see `cacheTtlFor` below, which explains why
+ * the mass-logout control keeps the short lifetime and the signup flag does
+ * not.
  *
  * THE CACHE IS MODULE-LEVEL, NOT PER INSTANCE, and that is the whole point.
  *
@@ -37,7 +38,66 @@ import {
   type SystemSettingKey,
 } from "./registry";
 
+/**
+ * Default cache lifetime. Short, so an operator's change reaches every isolate
+ * quickly -- including the emergency controls, which is the point.
+ */
 const CACHE_TTL_MS = 5_000;
+
+/**
+ * Lifetime for the keys whose reads are what WAKE THE DATABASE.
+ *
+ * The distinction is not how risky a key is, it is whether reading it costs
+ * money. Neon bills compute by time awake and sleeps after five minutes of
+ * silence, so the only reads worth lengthening are the ones that happen on
+ * requests which would otherwise never touch Postgres at all.
+ *
+ * `session_epoch` and `session_policy` are read on every AUTHENTICATED request
+ * -- and those already query the database to load the session, so the compute
+ * is awake regardless. Caching them longer would save a query and not one
+ * second of compute time, while delaying the emergency "log everyone out"
+ * switch. So they deliberately keep the short TTL: that control is exactly as
+ * fast as it was before this change.
+ */
+const PUBLIC_READ_TTL_MS = 5 * 60_000;
+
+/**
+ * Keys read while rendering a page or serving a request that carries no
+ * session, which is to say: the ones a scanner can trigger. Each of these would
+ * otherwise reset Neon's five-minute idle timer every five seconds, forever.
+ *
+ * The cost of being on this list is propagation delay. Pausing signups, closing
+ * early access, closing the support form, or widening a rate-limit bucket takes
+ * up to PUBLIC_READ_TTL_MS to reach every isolate instead of CACHE_TTL_MS. The
+ * base rate limits still apply throughout, and nothing here can log a user in
+ * who should not be.
+ */
+const LONG_CACHE_KEYS: ReadonlySet<string> = new Set([
+  // apps/web/app/routes/auth/signup.tsx, marketing/early-access.tsx,
+  // packages/api/src/routes/auth.ts -- all reachable with no session.
+  "signup_enabled",
+  // apps/web/app/routes/marketing/early-access.tsx
+  "early_access_open",
+  // apps/web/app/routes/marketing/contact.tsx, packages/api/src/routes/public.ts
+  "support_form_enabled",
+  // packages/api/src/index.ts -- consulted by the rate limiter on every request.
+  "rate_limit_overrides",
+]);
+
+/**
+ * How long a value for `key` may be served from cache.
+ *
+ * Exported so the test suite can assert the classification directly. A typo in
+ * LONG_CACHE_KEYS would otherwise fail silently -- the key would simply keep
+ * the short TTL and the bill would not move, which is the hardest kind of
+ * regression to notice.
+ */
+export function cacheTtlFor(key: string): number {
+  return LONG_CACHE_KEYS.has(key) ? PUBLIC_READ_TTL_MS : CACHE_TTL_MS;
+}
+
+/** The keys that carry the longer lifetime, for tests and for documentation. */
+export const longCachedSettingKeys: readonly string[] = [...LONG_CACHE_KEYS];
 
 interface CacheEntry<T> {
   value: T;
@@ -69,7 +129,7 @@ export class SettingsService {
     // accidentally expose unbuilt functionality.
     const value = row?.enabled ?? FEATURE_FLAGS[key].default;
 
-    flagCache.set(key, { value, expiresAt: Date.now() + CACHE_TTL_MS });
+    flagCache.set(key, { value, expiresAt: Date.now() + cacheTtlFor(key) });
     return value;
   }
 
@@ -128,7 +188,7 @@ export class SettingsService {
       }
     }
 
-    settingCache.set(key, { value, expiresAt: Date.now() + CACHE_TTL_MS });
+    settingCache.set(key, { value, expiresAt: Date.now() + cacheTtlFor(key) });
     return value as (typeof SYSTEM_SETTINGS)[K]["default"];
   }
 

@@ -66,8 +66,39 @@ interface Slot {
 const slots = new Map<string, Slot>();
 let lastFlushAt = Date.now();
 
-/** How long an isolate may hold counters before writing them out. */
-const FLUSH_INTERVAL_MS = 60_000;
+/**
+ * How long an isolate may hold counters before writing them out.
+ *
+ * THIS INTERVAL IS A BILLING CONTROL, not a freshness preference, and it must
+ * stay comfortably above `SCALE_TO_ZERO_IDLE_MS`.
+ *
+ * Neon suspends a compute after five minutes with no queries, and a suspended
+ * compute is free. This flush is the only Postgres write that fires on traffic
+ * alone -- it needs no user, no session and no JavaScript, so a scanner probing
+ * the site is enough to trigger it. At the previous 60 seconds it therefore
+ * reset the five-minute idle timer before it could ever elapse, and the
+ * database never slept: ~16 hours a day awake, 110 CU-hours in October 2026,
+ * which exhausted the Free plan's 100 and took signups down for ~45 hours.
+ *
+ * Thirty minutes means the compute is woken roughly twice an hour and sleeps
+ * through the rest, at the cost of admin request-metrics graphs lagging by up
+ * to half an hour. Telemetry is already lossy by design -- `drain()` clears the
+ * counters before the write, and in-memory counters die with the isolate -- so
+ * staleness is the cheapest thing here to spend.
+ */
+const FLUSH_INTERVAL_MS = 30 * 60_000;
+
+/**
+ * Neon's scale-to-zero idle window: five minutes of no queries at all.
+ *
+ * Exported so the test suite can assert the invariant above rather than
+ * restating the number, and so the next person to tune the interval sees what
+ * it is measured against.
+ */
+export const SCALE_TO_ZERO_IDLE_MS = 5 * 60_000;
+
+/** Exported for the same reason. */
+export const FLUSH_INTERVAL = FLUSH_INTERVAL_MS;
 /** A hard ceiling, so a burst flushes on volume rather than waiting for the clock. */
 const FLUSH_AT_SLOTS = 64;
 
